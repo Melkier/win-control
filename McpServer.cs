@@ -1,3 +1,4 @@
+﻿using System.IO;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -99,6 +100,30 @@ internal static class McpServer
     {
         return new JsonArray
         {
+            Tool("desktop_uia_tree", "Lee el arbol semantico completo de accesibilidad (UI Automation) de la ventana activa o indicada: textos, botones, enlaces, entradas y coordenadas en Chrome, Edge, Electron, WPF, WinUI y Win32.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["target"] = Prop("string", "Opcional: HWND o subcadena de titulo/proceso. Si se omite, lee la ventana activa."),
+                    ["max_depth"] = Prop("integer", "Opcional: profundidad maxima del arbol (defecto 6, max 15)."),
+                    ["max_nodes"] = Prop("integer", "Opcional: maximo de nodos a devolver (defecto 250, max 1500).")
+                }
+            }),
+            Tool("desktop_focused", "Devuelve en tiempo real el elemento actualmente enfocado, su texto/valor, ventana y si el proceso corre elevado.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject()
+            }),
+            Tool("desktop_watch_events", "Inicia, consulta o detiene un monitor en tiempo real de eventos de foco y cambios de ventana en todo Windows.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["action"] = Prop("string", "Accion: start (iniciar), poll (leer eventos acumulados) o stop (detener).")
+                },
+                ["required"] = new JsonArray("action")
+            }),
             Tool("desktop_screens", "Lista monitores conectados y sus coordenadas/resoluciones fisicas.", new JsonObject
             {
                 ["type"] = "object",
@@ -239,6 +264,12 @@ internal static class McpServer
                     RequireInt(args, "delta"))),
                 "desktop_type" => TextResult(Program.TypeText(RequireStr(args, "text"))),
                 "desktop_key" => TextResult(Program.SendKeyCombo(RequireStr(args, "combo"))),
+                "desktop_uia_tree" => TextResult(AccessibilityReader.GetUiTreeJson(
+                    args["target"]?.GetValue<string>(),
+                    args["max_depth"]?.GetValue<int?>() ?? 6,
+                    args["max_nodes"]?.GetValue<int?>() ?? 250)),
+                "desktop_focused" => TextResult(AccessibilityReader.GetFocusedJson()),
+                "desktop_watch_events" => TextResult(AccessibilityReader.ControlWatchMcp(RequireStr(args, "action"))),
                 _ => ErrorResult($"Herramienta desconocida: {name}")
             };
         }
@@ -363,3 +394,5 @@ internal static class McpServer
         Console.Out.Flush();
     }
 }
+
+

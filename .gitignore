@@ -8,3 +8,7 @@ obj/
 AGENTS.md
 AGENTS.override.md
 .agents/
+
+CONTEXTO_GEMINI.md
+1_exportar_para_gemini.bat
+2_compilar_y_subir.bat

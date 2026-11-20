@@ -1,3 +1,4 @@
+﻿using System.IO;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Imaging;
@@ -46,6 +47,9 @@ internal static class Program
                 "launch" => rest.Length < 1 ? Fail("Uso: launch <ruta> [args...]") : PrintOk(LaunchTarget(rest[0], rest.Length > 1 ? string.Join(" ", rest.Skip(1)) : "")),
                 "controls" => rest.Length < 1 ? Fail("Uso: controls <hwnd|titulo>") : PrintOk(GetControlsJson(rest[0])),
                 "screens" => PrintOk(GetScreensJson()),
+                "uia" => CmdUia(rest),
+                "focused" => PrintOk(AccessibilityReader.GetFocusedJson()),
+                "watch" => CmdWatch(),
                 _ => Fail($"Comando desconocido: {cmd}")
             };
         }
@@ -95,6 +99,9 @@ Comandos CLI:
   type <texto>                             Escribe texto Unicode en la ventana activa
   key <combo>                              Envia teclas/atajos (ej: Enter, Ctrl+S, Alt+F4)
   launch <ruta_o_comando> [args...]        Abre app/carpeta/acceso directo via Shell (persistente)
+  uia [hwnd|titulo] [--depth 6] [--max 250] Lee arbol semantico UI Automation (Chrome, WPF, WinUI, Electron)
+  focused                                  Lee el elemento y texto actualmente enfocado en Windows
+  watch                                    Streaming en tiempo real (NDJSON) de foco y ventanas
 """);
     }
 
@@ -390,6 +397,29 @@ Comandos CLI:
         }, JsonOpts);
     }
 
+    internal static IntPtr ResolveTargetHwnd(string? target)
+    {
+        if (string.IsNullOrWhiteSpace(target))
+            return Native.GetForegroundWindow();
+        var win = ResolveWindow(target) ?? throw new InvalidOperationException($"No se encontro ventana para: {target}");
+        return win.Hwnd;
+    }
+
+    private static int CmdUia(string[] args)
+    {
+        string? target = args.Length > 0 && !args[0].StartsWith("--") ? args[0] : null;
+        int depth = int.TryParse(ParseOpt(args, "--depth"), out var d) ? d : 6;
+        int maxNodes = int.TryParse(ParseOpt(args, "--max"), out var m) ? m : 250;
+        return PrintOk(AccessibilityReader.GetUiTreeJson(target, depth, maxNodes));
+    }
+
+    private static int CmdWatch()
+    {
+        using var cts = new CancellationTokenSource();
+        Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
+        return AccessibilityReader.RunWatchCli(cts.Token);
+    }
+
     private static WindowInfo? ResolveWindow(string spec)
     {
         var wins = GetVisibleWindows();
@@ -631,3 +661,5 @@ internal static class Native
         public ushort wParamL, wParamH;
     }
 }
+
+
