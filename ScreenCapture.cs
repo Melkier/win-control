@@ -47,6 +47,7 @@ internal static class ScreenCapture
             bool tryPrintWindow = !captureMode.Equals("screen", StringComparison.OrdinalIgnoreCase)
                                   && !Native.IsIconic(win.Hwnd);
 
+            string fallbackReason = "screen";
             if (tryPrintWindow)
             {
                 var pwBmp = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
@@ -64,16 +65,17 @@ internal static class ScreenCapture
                     }
                 }
 
-                if (ok)
+                if (ok && !IsPureBlackFrame(pwBmp))
                     return new CaptureResult(pwBmp, bounds, "print_window");
 
+                fallbackReason = ok ? "screen_black_fallback" : "screen_fallback";
                 pwBmp.Dispose();
             }
 
             var fbBmp = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
             using (var g = Graphics.FromImage(fbBmp))
                 g.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, bounds.Size, CopyPixelOperation.SourceCopy);
-            return new CaptureResult(fbBmp, bounds, tryPrintWindow ? "screen_fallback" : "screen");
+            return new CaptureResult(fbBmp, bounds, fallbackReason);
         }
 
         Rectangle screenBounds = Program.ResolveCaptureBounds(null, monitorIdx);
@@ -81,6 +83,25 @@ internal static class ScreenCapture
         using (var g = Graphics.FromImage(fullBmp))
             g.CopyFromScreen(screenBounds.Left, screenBounds.Top, 0, 0, screenBounds.Size, CopyPixelOperation.SourceCopy);
         return new CaptureResult(fullBmp, screenBounds, monitorIdx.HasValue ? "monitor" : "virtual_screen");
+    }
+
+    private static bool IsPureBlackFrame(Bitmap bmp)
+    {
+        if (bmp.Width < 16 || bmp.Height < 16) return false;
+        int cols = 12;
+        int rows = 12;
+        for (int r = 1; r <= rows; r++)
+        {
+            int y = bmp.Height * r / (rows + 1);
+            for (int c = 1; c <= cols; c++)
+            {
+                int x = bmp.Width * c / (cols + 1);
+                var p = bmp.GetPixel(x, y);
+                if (p.R != 0 || p.G != 0 || p.B != 0)
+                    return false;
+            }
+        }
+        return true;
     }
 
     public static EncodedImage EncodeBitmap(Bitmap fullBmp, int maxWidth, string format = "png", int quality = 80)

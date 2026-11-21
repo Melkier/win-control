@@ -57,7 +57,7 @@ internal static class McpServer
                         ["serverInfo"] = new JsonObject
                         {
                             ["name"] = "win-control",
-                            ["version"] = "2.0.0"
+                            ["version"] = "2.1.0"
                         }
                     };
                     SendResult(id, result);
@@ -92,6 +92,17 @@ internal static class McpServer
     {
         return new JsonArray
         {
+            Tool("desktop_screen_summary", "Resumen de accesibilidad de baja sobrecarga cognitiva: devuelve foco actual, controles interactivos visibles y textos legibles sin ruido estructural.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["target"] = Prop("string", "Opcional: HWND o subcadena de titulo/proceso. Si se omite, resume la ventana activa."),
+                    ["max_items"] = Prop("integer", "Opcional: maximo de controles interactivos (defecto 40)."),
+                    ["max_texts"] = Prop("integer", "Opcional: maximo de textos legibles (defecto 30)."),
+                    ["timeout_ms"] = Prop("integer", "Opcional: limite de tiempo en ms (defecto 3000).")
+                }
+            }),
             Tool("desktop_uia_tree", "Lee el arbol semantico de accesibilidad (UI Automation) de la ventana activa o indicada con filtros opcionales y timeout seguro.", new JsonObject
             {
                 ["type"] = "object",
@@ -155,7 +166,7 @@ internal static class McpServer
                     ["lang"] = Prop("string", "Opcional: codigo de idioma instalado (ej: es-ES, en-US).")
                 }
             }),
-            Tool("desktop_screenshot", "Captura pantalla, monitor, ventana (con PrintWindow anti-oclusion) o region en PNG o JPEG con coordenadas fisicas.", new JsonObject
+            Tool("desktop_screenshot", "Captura pantalla, monitor, ventana (con PrintWindow anti-oclusion y respaldo anti-frame-negro) o region en PNG o JPEG.", new JsonObject
             {
                 ["type"] = "object",
                 ["properties"] = new JsonObject
@@ -166,8 +177,22 @@ internal static class McpServer
                     ["max_width"] = Prop("integer", "Opcional: ancho maximo en pixeles (defecto 1280)."),
                     ["format"] = Prop("string", "Opcional: png (defecto) o jpeg (mas ligero para tiempo real)."),
                     ["quality"] = Prop("integer", "Opcional: calidad JPEG 10-100 (defecto 80)."),
-                    ["capture_mode"] = Prop("string", "Opcional: auto (defecto, usa PrintWindow en ventanas) o screen.")
+                    ["capture_mode"] = Prop("string", "Opcional: auto (defecto, usa PrintWindow con deteccion de frame negro) o screen.")
                 }
+            }),
+            Tool("desktop_sequence", "Ejecuta una cadena de hasta 50 pasos en una sola llamada con freno de seguridad instantaneo al presionar Esc.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["steps"] = new JsonObject
+                    {
+                        ["type"] = "array",
+                        ["description"] = "Arreglo de pasos. Cada paso lleva 'op': wait, click, hover, mouse_relative, drag, scroll, key, type, focus o uia_act."
+                    },
+                    ["abort_on_esc"] = Prop("boolean", "Opcional: detiene inmediatamente si el usuario pulsa Esc (defecto true).")
+                },
+                ["required"] = new JsonArray("steps")
             }),
             Tool("desktop_screens", "Lista monitores conectados y sus coordenadas/resoluciones fisicas.", new JsonObject
             {
@@ -265,7 +290,18 @@ internal static class McpServer
                 },
                 ["required"] = new JsonArray("x", "y")
             }),
-            Tool("desktop_drag", "Arrastra el cursor desde (x1, y1) hasta (x2, y2).", new JsonObject
+            Tool("desktop_mouse_relative", "Envia desplazamiento relativo del raton (dx, dy) compatible con entornos 3D y aplicaciones de entrada directa.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["dx"] = Prop("integer", "Desplazamiento horizontal relativo."),
+                    ["dy"] = Prop("integer", "Desplazamiento vertical relativo."),
+                    ["steps"] = Prop("integer", "Opcional: dividir el movimiento en N pasos suaves (defecto 1, max 60).")
+                },
+                ["required"] = new JsonArray("dx", "dy")
+            }),
+            Tool("desktop_drag", "Arrastra el cursor desde (x1, y1) hasta (x2, y2) con freno Esc.", new JsonObject
             {
                 ["type"] = "object",
                 ["properties"] = new JsonObject
@@ -298,24 +334,31 @@ internal static class McpServer
                 },
                 ["required"] = new JsonArray("text")
             }),
-            Tool("desktop_key", "Envia una tecla o combinacion de atajo (ej: Enter, Esc, Ctrl+S, Alt+F4).", new JsonObject
+            Tool("desktop_key", "Envia una tecla o combinacion con ScanCodes de hardware y duracion configurable (hold_ms) con freno Esc.", new JsonObject
             {
                 ["type"] = "object",
                 ["properties"] = new JsonObject
                 {
-                    ["combo"] = Prop("string", "Tecla o combinacion separada por '+'.")
+                    ["combo"] = Prop("string", "Tecla o combinacion separada por '+' (ej: Enter, Ctrl+S, W)."),
+                    ["hold_ms"] = Prop("integer", "Opcional: duracion en milisegundos manteniendo pulsada la tecla (defecto 30, max 15000)."),
+                    ["scancode"] = Prop("boolean", "Opcional: usar ScanCodes de hardware (defecto true).")
                 },
                 ["required"] = new JsonArray("combo")
             })
         };
     }
 
-    private static JsonObject ExecuteTool(string name, JsonObject args)
+    internal static JsonObject ExecuteTool(string name, JsonObject args)
     {
         try
         {
             return name switch
             {
+                "desktop_screen_summary" => TextResult(AccessibilityReader.GetAccessibleSummaryJson(
+                    args["target"]?.GetValue<string>(),
+                    args["max_items"]?.GetValue<int?>() ?? 40,
+                    args["max_texts"]?.GetValue<int?>() ?? 30,
+                    args["timeout_ms"]?.GetValue<int?>() ?? 3000)),
                 "desktop_uia_tree" => TextResult(AccessibilityReader.GetUiTreeJson(
                     args["target"]?.GetValue<string>(),
                     args["max_depth"]?.GetValue<int?>() ?? 6,
@@ -350,6 +393,9 @@ internal static class McpServer
                     args["format"]?.GetValue<string>() ?? "png",
                     args["quality"]?.GetValue<int?>() ?? 80,
                     args["capture_mode"]?.GetValue<string>() ?? "auto"),
+                "desktop_sequence" => TextResult(Program.ExecuteSequenceJson(
+                    args["steps"] as JsonArray ?? throw new ArgumentException("Falta el arreglo requerido: steps"),
+                    args["abort_on_esc"]?.GetValue<bool?>() ?? true)),
                 "desktop_screens" => TextResult(Program.GetScreensJson()),
                 "desktop_windows" => TextResult(Program.GetWindowsJson(args["filter"]?.GetValue<string>())),
                 "desktop_controls" => TextResult(Program.GetControlsJson(RequireStr(args, "target"))),
@@ -377,6 +423,10 @@ internal static class McpServer
                 "desktop_hover" => TextResult(Program.HoverAt(
                     RequireInt(args, "x"),
                     RequireInt(args, "y"))),
+                "desktop_mouse_relative" => TextResult(Program.MoveMouseRelative(
+                    RequireInt(args, "dx"),
+                    RequireInt(args, "dy"),
+                    args["steps"]?.GetValue<int?>() ?? 1)),
                 "desktop_drag" => TextResult(Program.DragBetween(
                     RequireInt(args, "x1"),
                     RequireInt(args, "y1"),
@@ -388,7 +438,10 @@ internal static class McpServer
                     RequireInt(args, "y"),
                     RequireInt(args, "delta"))),
                 "desktop_type" => TextResult(Program.TypeText(RequireStr(args, "text"))),
-                "desktop_key" => TextResult(Program.SendKeyCombo(RequireStr(args, "combo"))),
+                "desktop_key" => TextResult(Program.SendKeyCombo(
+                    RequireStr(args, "combo"),
+                    args["hold_ms"]?.GetValue<int?>() ?? 30,
+                    args["scancode"]?.GetValue<bool?>() ?? true)),
                 _ => ErrorResult($"Herramienta desconocida: {name}")
             };
         }

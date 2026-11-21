@@ -13,9 +13,21 @@ internal static class AccessibilityReader
     private static readonly JsonSerializerOptions CompactJson = new() { WriteIndented = false };
     private static readonly AutomationEvent? LiveRegionChangedEvent = TryLookupEvent(20024);
 
+    private static readonly HashSet<string> InteractiveTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Button", "Hyperlink", "Edit", "ComboBox", "CheckBox", "RadioButton",
+        "MenuItem", "TabItem", "ListItem", "TreeItem", "Slider", "SplitButton"
+    };
+
+    private static readonly HashSet<string> TextTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "Text", "Document", "Header", "HeaderItem", "StatusBar", "ToolTip"
+    };
+
     private static readonly object WatchLock = new();
     private static readonly ConcurrentQueue<UiEvent> EventQueue = new();
     private static CancellationTokenSource? _mcpWatchCts;
+    private static Task? _mcpWatchTask;
     private static bool _mcpWatching;
     private static string _lastSignature = "";
     private const int MaxQueuedEvents = 300;
@@ -100,6 +112,136 @@ internal static class AccessibilityReader
                 Element = snapshot
             }, PrettyJson);
         });
+    }
+
+    public static string GetAccessibleSummaryJson(string? target, int maxItems = 40, int maxTexts = 30, int timeoutMs = 3000)
+    {
+        maxItems = Math.Clamp(maxItems, 5, 200);
+        maxTexts = Math.Clamp(maxTexts, 5, 200);
+        timeoutMs = Math.Clamp(timeoutMs, 200, 15000);
+
+        return RunOnMta(() =>
+        {
+            var sw = Stopwatch.StartNew();
+            IntPtr hwnd = Program.ResolveTargetHwnd(target);
+            if (hwnd == IntPtr.Zero)
+                throw new InvalidOperationException("No se encontro ventana activa o destino.");
+
+            var root = AutomationElement.FromHandle(hwnd)
+                       ?? throw new InvalidOperationException($"UI Automation no pudo abrir HWND 0x{hwnd.ToInt64():X}.");
+
+            var procCache = new Dictionary<int, string>();
+            var interactive = new List<object>();
+            var texts = new List<string>();
+            var seenInteractive = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var seenTexts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            bool timedOut = false;
+
+            CollectSummary(root, TreeWalker.ControlViewWalker, 0, 8, maxItems, maxTexts, sw, timeoutMs,
+                ref timedOut, interactive, texts, seenInteractive, seenTexts);
+
+            object? focusedSnapshot = null;
+            try
+            {
+                var foc = AutomationElement.FocusedElement;
+                if (foc != null) focusedSnapshot = ReadElement(foc, procCache, includeWindow: false);
+            }
+            catch { }
+
+            sw.Stop();
+            return JsonSerializer.Serialize(new
+            {
+                Elevated = IsElevated(),
+                UipiWarning = Native.GetUipiWarning(hwnd),
+                TargetHwnd = $"0x{hwnd.ToInt64():X}",
+                WindowTitle = SafeStr(() => root.Current.Name),
+                ProcessName = ResolveProcessName(SafeInt(() => root.Current.ProcessId), procCache),
+                ElapsedMs = sw.ElapsedMilliseconds,
+                TimedOut = timedOut,
+                Focused = focusedSnapshot,
+                InteractiveCount = interactive.Count,
+                Interactive = interactive,
+                TextCount = texts.Count,
+                ReadableTexts = texts
+            }, PrettyJson);
+        });
+    }
+
+    private static void CollectSummary(
+        AutomationElement el,
+        TreeWalker walker,
+        int depth,
+        int maxDepth,
+        int maxItems,
+        int maxTexts,
+        Stopwatch sw,
+        int timeoutMs,
+        ref bool timedOut,
+        List<object> interactive,
+        List<string> texts,
+        HashSet<string> seenInteractive,
+        HashSet<string> seenTexts)
+    {
+        if (depth > maxDepth) return;
+        if (interactive.Count >= maxItems && texts.Count >= maxTexts) return;
+        if (sw.ElapsedMilliseconds >= timeoutMs) { timedOut = true; return; }
+
+        try
+        {
+            bool isOffscreen = el.Current.IsOffscreen;
+            if (!isOffscreen)
+            {
+                string cType = CleanControlType(el.Current.ControlType.ProgrammaticName);
+                bool isPassword = el.Current.IsPassword;
+                string name = Truncate(el.Current.Name, 200).Trim();
+                string autoId = el.Current.AutomationId ?? "";
+                string? value = ReadValue(el, isPassword);
+
+                if (interactive.Count < maxItems && InteractiveTypes.Contains(cType) && el.Current.IsEnabled)
+                {
+                    if (!string.IsNullOrWhiteSpace(name) || !string.IsNullOrWhiteSpace(autoId) || !string.IsNullOrWhiteSpace(value))
+                    {
+                        var bounds = ReadBounds(el);
+                        string sig = $"{cType}|{name}|{autoId}|{bounds?.X},{bounds?.Y}";
+                        if (seenInteractive.Add(sig))
+                        {
+                            interactive.Add(new
+                            {
+                                ControlType = cType,
+                                Name = name,
+                                AutomationId = autoId,
+                                Value = value,
+                                Bounds = bounds
+                            });
+                        }
+                    }
+                }
+                else if (texts.Count < maxTexts && TextTypes.Contains(cType))
+                {
+                    string candidate = !string.IsNullOrWhiteSpace(name)
+                        ? name
+                        : (ReadTextSnippet(el, isPassword) ?? value ?? "");
+                    if (!string.IsNullOrWhiteSpace(candidate) && seenTexts.Add(candidate))
+                    {
+                        texts.Add(candidate);
+                    }
+                }
+            }
+        }
+        catch { }
+
+        if (depth == maxDepth) return;
+
+        AutomationElement? child = null;
+        try { child = walker.GetFirstChild(el); } catch { return; }
+
+        while (child != null && (interactive.Count < maxItems || texts.Count < maxTexts))
+        {
+            if (sw.ElapsedMilliseconds >= timeoutMs) { timedOut = true; return; }
+            CollectSummary(child, walker, depth + 1, maxDepth, maxItems, maxTexts, sw, timeoutMs,
+                ref timedOut, interactive, texts, seenInteractive, seenTexts);
+            try { child = walker.GetNextSibling(child); } catch { break; }
+        }
     }
 
     public static string GetUiTreeJson(
@@ -371,7 +513,7 @@ internal static class AccessibilityReader
                         _mcpWatchCts = new CancellationTokenSource();
                         var token = _mcpWatchCts.Token;
 
-                        Task.Run(() => RunWatchLoop(token, EnqueueEvent), token);
+                        _mcpWatchTask = Task.Run(() => RunWatchLoop(token, EnqueueEvent), token);
                         _mcpWatching = true;
                     }
                 }
@@ -395,12 +537,25 @@ internal static class AccessibilityReader
                 }, PrettyJson);
 
             case "stop":
+                CancellationTokenSource? ctsToStop;
+                Task? taskToWait;
                 lock (WatchLock)
                 {
-                    _mcpWatchCts?.Cancel();
-                    _mcpWatchCts?.Dispose();
+                    ctsToStop = _mcpWatchCts;
+                    taskToWait = _mcpWatchTask;
                     _mcpWatchCts = null;
+                    _mcpWatchTask = null;
                     _mcpWatching = false;
+                }
+
+                if (ctsToStop != null)
+                {
+                    try { ctsToStop.Cancel(); } catch { }
+                    if (taskToWait != null)
+                    {
+                        try { taskToWait.Wait(1500); } catch { }
+                    }
+                    try { ctsToStop.Dispose(); } catch { }
                 }
                 return JsonSerializer.Serialize(new { Watching = false }, PrettyJson);
 
@@ -409,7 +564,7 @@ internal static class AccessibilityReader
         }
     }
 
-    private static void RunWatchLoop(CancellationToken ct, Action<UiEvent> emit)
+    internal static void RunWatchLoop(CancellationToken ct, Action<UiEvent> emit)
     {
         AutomationFocusChangedEventHandler focusHandler = (sender, _) =>
         {
@@ -493,7 +648,9 @@ internal static class AccessibilityReader
                     }
                     catch { }
                 }
-                ct.WaitHandle.WaitOne(200);
+
+                try { ct.WaitHandle.WaitOne(200); }
+                catch (ObjectDisposedException) { break; }
             }
         }
         finally
@@ -559,17 +716,11 @@ internal static class AccessibilityReader
             if (typeOk && idOk)
             {
                 if (string.IsNullOrWhiteSpace(name))
-                {
                     exactMatches.Add(el);
-                }
                 else if (elName.Equals(name, StringComparison.OrdinalIgnoreCase))
-                {
                     exactMatches.Add(el);
-                }
                 else if (elName.Contains(name, StringComparison.OrdinalIgnoreCase))
-                {
                     partialMatches.Add(el);
-                }
             }
         }
         catch { }
@@ -817,7 +968,12 @@ internal static class AccessibilityReader
         if (pid <= 0) return "";
         if (cache != null && cache.TryGetValue(pid, out var cached)) return cached;
         string name = "";
-        try { name = Process.GetProcessById(pid).ProcessName; } catch { }
+        try
+        {
+            using var proc = Process.GetProcessById(pid);
+            name = proc.ProcessName;
+        }
+        catch { }
         if (cache != null) cache[pid] = name;
         return name;
     }

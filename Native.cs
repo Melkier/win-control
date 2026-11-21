@@ -12,6 +12,7 @@ internal static class Native
     public const uint WM_CLOSE = 0x0010;
     public const uint PW_RENDERFULLCONTENT = 0x00000002;
 
+    public const uint MOUSEEVENTF_MOVE = 0x0001;
     public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
     public const uint MOUSEEVENTF_LEFTUP = 0x0004;
     public const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
@@ -22,10 +23,14 @@ internal static class Native
 
     private const uint INPUT_MOUSE = 0;
     private const uint INPUT_KEYBOARD = 1;
+    private const uint KEYEVENTF_EXTENDEDKEY = 0x0001;
     private const uint KEYEVENTF_KEYUP = 0x0002;
     private const uint KEYEVENTF_UNICODE = 0x0004;
+    private const uint KEYEVENTF_SCANCODE = 0x0008;
+    private const uint MAPVK_VK_TO_VSC = 0;
     private const ushort VK_TAB = 0x09;
     private const ushort VK_RETURN = 0x0D;
+    private const int VK_ESCAPE = 0x1B;
 
     private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
     private const uint TOKEN_QUERY = 0x0008;
@@ -52,6 +57,8 @@ internal static class Native
     [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
     [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
+    [DllImport("user32.dll")] private static extern uint MapVirtualKey(uint uCode, uint uMapType);
+    [DllImport("user32.dll")] private static extern short GetAsyncKeyState(int vKey);
     [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
     [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr hObject);
@@ -66,6 +73,8 @@ internal static class Native
     {
         try { SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { }
     }
+
+    public static bool IsEscapePressed() => (GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0;
 
     public static string GetWindowTextString(IntPtr hWnd)
     {
@@ -142,6 +151,16 @@ internal static class Native
         SendInputsChecked(new[] { input });
     }
 
+    public static void SendMouseMoveRelative(int dx, int dy)
+    {
+        var input = new INPUT
+        {
+            type = INPUT_MOUSE,
+            U = new InputUnion { mi = new MOUSEINPUT { dx = dx, dy = dy, dwFlags = MOUSEEVENTF_MOVE } }
+        };
+        SendInputsChecked(new[] { input });
+    }
+
     public static void SendMouseWheel(int delta)
     {
         var input = new INPUT
@@ -152,8 +171,19 @@ internal static class Native
         SendInputsChecked(new[] { input });
     }
 
-    public static void SendKey(ushort vk, bool keyUp)
+    private static bool IsExtendedKey(ushort vk) => vk is
+        0x21 or 0x22 or 0x23 or 0x24 or
+        0x25 or 0x26 or 0x27 or 0x28 or
+        0x2C or 0x2D or 0x2E or 0x5B or 0x5C;
+
+    public static void SendKey(ushort vk, bool keyUp, bool useScanCode = true)
     {
+        ushort scan = (ushort)MapVirtualKey(vk, MAPVK_VK_TO_VSC);
+        bool sendScan = useScanCode && scan != 0;
+        uint flags = keyUp ? KEYEVENTF_KEYUP : 0;
+        if (IsExtendedKey(vk)) flags |= KEYEVENTF_EXTENDEDKEY;
+        if (sendScan) flags |= KEYEVENTF_SCANCODE;
+
         var input = new INPUT
         {
             type = INPUT_KEYBOARD,
@@ -161,8 +191,9 @@ internal static class Native
             {
                 ki = new KEYBDINPUT
                 {
-                    wVk = vk,
-                    dwFlags = keyUp ? KEYEVENTF_KEYUP : 0
+                    wVk = sendScan ? (ushort)0 : vk,
+                    wScan = scan,
+                    dwFlags = flags
                 }
             }
         };

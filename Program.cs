@@ -2,6 +2,7 @@
 using System.Drawing;
 using System.IO;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Windows.Forms;
 
 namespace WinControl;
@@ -26,6 +27,12 @@ internal static class Program
             return McpServer.Run();
         }
 
+        if (args[0] is "--realtime" or "realtime")
+        {
+            int port = args.Length > 1 && int.TryParse(args[1], out int p) ? p : 47655;
+            return RealtimeBridge.Run(port);
+        }
+
         try
         {
             var cmd = args[0].ToLowerInvariant();
@@ -38,13 +45,15 @@ internal static class Program
                 "focus" => rest.Length < 1 ? Fail("Uso: focus <hwnd|titulo>") : PrintOk(FocusTarget(rest[0])),
                 "click" => CmdClick(rest),
                 "hover" => CmdHover(rest),
+                "mouse-rel" => CmdMouseRel(rest),
                 "drag" => CmdDrag(rest),
                 "scroll" => CmdScroll(rest),
                 "type" => rest.Length < 1 ? Fail("Uso: type <texto>") : PrintOk(TypeText(string.Join(" ", rest))),
-                "key" => rest.Length < 1 ? Fail("Uso: key <combo>") : PrintOk(SendKeyCombo(rest[0])),
+                "key" => CmdKey(rest),
                 "launch" => rest.Length < 1 ? Fail("Uso: launch <ruta> [args...]") : PrintOk(LaunchTarget(rest[0], rest.Length > 1 ? string.Join(" ", rest.Skip(1)) : "")),
                 "controls" => rest.Length < 1 ? Fail("Uso: controls <hwnd|titulo>") : PrintOk(GetControlsJson(rest[0])),
                 "screens" => PrintOk(GetScreensJson()),
+                "summary" => CmdSummary(rest),
                 "uia" => CmdUia(rest),
                 "uia-act" => CmdUiaAct(rest),
                 "focused" => PrintOk(AccessibilityReader.GetFocusedJson()),
@@ -86,12 +95,14 @@ internal static class Program
     private static void PrintHelp()
     {
         Console.WriteLine("""
-win-control v2.0 - Utilidad local y servidor MCP de accesibilidad y control de escritorio Windows
+win-control v2.1 - Plataforma local de accesibilidad y control asistido para Windows
 
-Modos:
-  --mcp                                     Inicia como servidor MCP (stdio JSON-RPC 2.0)
+Modos de ejecucion:
+  --mcp                                     Servidor MCP (stdio JSON-RPC 2.0) para Antigravity / agentes
+  --realtime [puerto]                       Puente local NDJSON en 127.0.0.1 (defecto 47655): eventos push + comandos
 
-Lectura y accesibilidad:
+Accesibilidad y percepcion:
+  summary [target] [--items 40] [--texts 30] Vista simplificada anti-sobrecarga (controles clave + textos + foco)
   uia [target] [--depth 6] [--max 250] [--filter txt] [--type ControlType] [--timeout 4000]
   uia-act <invoke|click|set_value|toggle|select|expand|collapse|focus> [--target win] [--name txt] [--id autoId] [--type ControlType] [--value txt] [--index 0]
   focused                                   Elemento actualmente enfocado en Windows
@@ -107,16 +118,17 @@ Ventanas y sistema:
   window <target> <minimize|maximize|restore|close|move> [x y w h]
   wait <target> [--timeout 10000]           Espera a que aparezca una ventana
   clipboard [get | set <texto>]             Lee o escribe el portapapeles
-  launch <ruta_o_comando> [args...]         Abre app/carpeta/acceso directo via Shell
+  launch <ruta_o_comando> [args...]         Abre app/carpeta/acceso directo/URL via Shell
 
-Captura y entrada fisica:
+Captura y entrada fisica (con freno de seguridad Esc en acciones sostenidas):
   screenshot <ruta> [--hwnd id|tit] [--monitor idx] [--region x,y,w,h] [--jpeg] [--quality 80] [--screen]
   click <x> <y> [--right|--double|--middle]
   hover <x> <y>
+  mouse-rel <dx> <dy> [--steps 1]
   drag <x1> <y1> <x2> <y2> [--steps 15]
   scroll <x> <y> <delta>
   type <texto>
-  key <combo>
+  key <combo> [--hold 30] [--vk]
 """);
     }
 
@@ -393,6 +405,43 @@ Captura y entrada fisica:
         return PrintOk(HoverAt(x, y));
     }
 
+    internal static string MoveMouseRelative(int dx, int dy, int steps = 1)
+    {
+        steps = Math.Clamp(steps, 1, 60);
+        int sentX = 0, sentY = 0;
+        for (int i = 1; i <= steps; i++)
+        {
+            int targetX = dx * i / steps;
+            int targetY = dy * i / steps;
+            int stepX = targetX - sentX;
+            int stepY = targetY - sentY;
+            if (stepX != 0 || stepY != 0)
+            {
+                Native.SendMouseMoveRelative(stepX, stepY);
+                sentX = targetX;
+                sentY = targetY;
+            }
+            if (i < steps) Thread.Sleep(10);
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            MovedRelative = true,
+            dx,
+            dy,
+            steps,
+            UipiWarning = Native.GetUipiWarning()
+        }, JsonOpts);
+    }
+
+    private static int CmdMouseRel(string[] args)
+    {
+        if (args.Length < 2 || !int.TryParse(args[0], out int dx) || !int.TryParse(args[1], out int dy))
+            return Fail("Uso: mouse-rel <dx> <dy> [--steps 1]");
+        int steps = int.TryParse(ParseOpt(args, "--steps"), out var s) ? s : 1;
+        return PrintOk(MoveMouseRelative(dx, dy, steps));
+    }
+
     internal static string ClickAt(int x, int y, string button)
     {
         string btn = button.ToLowerInvariant();
@@ -454,20 +503,28 @@ Captura y entrada fisica:
         Native.SetCursorPos(x1, y1);
         Thread.Sleep(40);
         Native.SendMouse(Native.MOUSEEVENTF_LEFTDOWN);
-        Thread.Sleep(30);
-
-        for (int i = 1; i <= steps; i++)
+        bool aborted = false;
+        try
         {
-            int cx = x1 + (x2 - x1) * i / steps;
-            int cy = y1 + (y2 - y1) * i / steps;
-            Native.SetCursorPos(cx, cy);
-            Thread.Sleep(15);
+            Thread.Sleep(30);
+            for (int i = 1; i <= steps; i++)
+            {
+                if (Native.IsEscapePressed()) { aborted = true; break; }
+                int cx = x1 + (x2 - x1) * i / steps;
+                int cy = y1 + (y2 - y1) * i / steps;
+                Native.SetCursorPos(cx, cy);
+                Thread.Sleep(15);
+            }
+        }
+        finally
+        {
+            try { Native.SendMouse(Native.MOUSEEVENTF_LEFTUP); } catch { }
         }
 
-        Native.SendMouse(Native.MOUSEEVENTF_LEFTUP);
         return JsonSerializer.Serialize(new
         {
-            Dragged = true,
+            Dragged = !aborted,
+            AbortedByUser = aborted,
             x1,
             y1,
             x2,
@@ -525,25 +582,198 @@ Captura y entrada fisica:
         }, JsonOpts);
     }
 
-    internal static string SendKeyCombo(string combo)
+    internal static string SendKeyCombo(string combo, int holdMs = 30, bool useScanCode = true)
     {
+        holdMs = Math.Clamp(holdMs, 10, 15000);
         var parts = combo.Split('+', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (parts.Length == 0) throw new ArgumentException("Combinacion de teclas vacia.");
+
         var vks = new List<ushort>();
+        bool sendingEsc = false;
         foreach (var p in parts)
         {
             if (!TryParseKey(p, out var vk))
                 throw new ArgumentException($"Tecla desconocida: {p}");
+            if (vk == 0x1B) sendingEsc = true;
             vks.Add(vk);
         }
 
-        foreach (var vk in vks) Native.SendKey(vk, false);
-        Thread.Sleep(30);
-        for (int i = vks.Count - 1; i >= 0; i--) Native.SendKey(vks[i], true);
+        var pressed = new List<ushort>(vks.Count);
+        bool aborted = false;
+        try
+        {
+            foreach (var vk in vks)
+            {
+                Native.SendKey(vk, false, useScanCode);
+                pressed.Add(vk);
+            }
+
+            if (holdMs <= 50)
+            {
+                Thread.Sleep(holdMs);
+            }
+            else
+            {
+                var sw = Stopwatch.StartNew();
+                while (sw.ElapsedMilliseconds < holdMs)
+                {
+                    if (!sendingEsc && Native.IsEscapePressed())
+                    {
+                        aborted = true;
+                        break;
+                    }
+                    Thread.Sleep(Math.Min(25, (int)Math.Max(1, holdMs - sw.ElapsedMilliseconds)));
+                }
+            }
+        }
+        finally
+        {
+            for (int i = pressed.Count - 1; i >= 0; i--)
+                try { Native.SendKey(pressed[i], true, useScanCode); } catch { }
+        }
 
         return JsonSerializer.Serialize(new
         {
             KeySent = combo,
+            HoldMs = holdMs,
+            ScanCode = useScanCode,
+            AbortedByUser = aborted,
             UipiWarning = Native.GetUipiWarning()
+        }, JsonOpts);
+    }
+
+    private static int CmdKey(string[] args)
+    {
+        if (args.Length < 1) return Fail("Uso: key <combo> [--hold 30] [--vk]");
+        int holdMs = int.TryParse(ParseOpt(args, "--hold"), out var h) ? h : 30;
+        bool useScanCode = !args.Contains("--vk");
+        return PrintOk(SendKeyCombo(args[0], holdMs, useScanCode));
+    }
+
+    internal static string ExecuteSequenceJson(JsonArray steps, bool abortOnEsc = true)
+    {
+        if (steps.Count == 0) throw new ArgumentException("La secuencia no contiene pasos.");
+        if (steps.Count > 50) throw new ArgumentException("Maximo 50 pasos por secuencia.");
+
+        var sw = Stopwatch.StartNew();
+        var results = new List<object>(steps.Count);
+        bool aborted = false;
+
+        for (int i = 0; i < steps.Count; i++)
+        {
+            var step = steps[i] as JsonObject
+                       ?? throw new ArgumentException($"El paso {i} debe ser un objeto JSON.");
+            string op = (step["op"]?.GetValue<string>() ?? "").Trim().ToLowerInvariant();
+            bool isEscKey = op == "key" && (step["combo"]?.GetValue<string>() ?? "").Contains("esc", StringComparison.OrdinalIgnoreCase);
+
+            if (abortOnEsc && !isEscKey && Native.IsEscapePressed())
+            {
+                aborted = true;
+                break;
+            }
+
+            switch (op)
+            {
+                case "wait":
+                    int ms = Math.Clamp(step["ms"]?.GetValue<int?>() ?? 200, 10, 10000);
+                    var wsw = Stopwatch.StartNew();
+                    while (wsw.ElapsedMilliseconds < ms)
+                    {
+                        if (abortOnEsc && Native.IsEscapePressed()) { aborted = true; break; }
+                        Thread.Sleep(Math.Min(25, (int)Math.Max(1, ms - wsw.ElapsedMilliseconds)));
+                    }
+                    results.Add(new { Step = i, Op = op, ElapsedMs = wsw.ElapsedMilliseconds, Aborted = aborted });
+                    break;
+
+                case "click":
+                    ClickAt(
+                        step["x"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta x"),
+                        step["y"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta y"),
+                        step["button"]?.GetValue<string>() ?? "left");
+                    results.Add(new { Step = i, Op = op, Ok = true });
+                    break;
+
+                case "hover":
+                    HoverAt(
+                        step["x"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta x"),
+                        step["y"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta y"));
+                    results.Add(new { Step = i, Op = op, Ok = true });
+                    break;
+
+                case "mouse_relative":
+                    MoveMouseRelative(
+                        step["dx"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta dx"),
+                        step["dy"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta dy"),
+                        step["steps"]?.GetValue<int?>() ?? 1);
+                    results.Add(new { Step = i, Op = op, Ok = true });
+                    break;
+
+                case "drag":
+                    DragBetween(
+                        step["x1"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta x1"),
+                        step["y1"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta y1"),
+                        step["x2"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta x2"),
+                        step["y2"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta y2"),
+                        step["steps"]?.GetValue<int?>() ?? 15);
+                    results.Add(new { Step = i, Op = op, Ok = true });
+                    break;
+
+                case "scroll":
+                    ScrollAt(
+                        step["x"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta x"),
+                        step["y"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta y"),
+                        step["delta"]?.GetValue<int?>() ?? throw new ArgumentException($"Paso {i}: falta delta"));
+                    results.Add(new { Step = i, Op = op, Ok = true });
+                    break;
+
+                case "key":
+                    SendKeyCombo(
+                        step["combo"]?.GetValue<string>() ?? throw new ArgumentException($"Paso {i}: falta combo"),
+                        step["hold_ms"]?.GetValue<int?>() ?? 30,
+                        step["scancode"]?.GetValue<bool?>() ?? true);
+                    results.Add(new { Step = i, Op = op, Ok = true });
+                    break;
+
+                case "type":
+                    TypeText(step["text"]?.GetValue<string>() ?? throw new ArgumentException($"Paso {i}: falta text"));
+                    results.Add(new { Step = i, Op = op, Ok = true });
+                    break;
+
+                case "focus":
+                    FocusTarget(step["target"]?.GetValue<string>() ?? throw new ArgumentException($"Paso {i}: falta target"));
+                    results.Add(new { Step = i, Op = op, Ok = true });
+                    break;
+
+                case "uia_act":
+                    AccessibilityReader.PerformUiAction(
+                        step["target"]?.GetValue<string>(),
+                        step["action"]?.GetValue<string>() ?? throw new ArgumentException($"Paso {i}: falta action"),
+                        step["name"]?.GetValue<string>(),
+                        step["automation_id"]?.GetValue<string>(),
+                        step["control_type"]?.GetValue<string>(),
+                        step["value"]?.GetValue<string>(),
+                        step["index"]?.GetValue<int?>() ?? 0,
+                        step["timeout_ms"]?.GetValue<int?>() ?? 4000);
+                    results.Add(new { Step = i, Op = op, Ok = true });
+                    break;
+
+                default:
+                    throw new ArgumentException($"Paso {i}: operacion desconocida '{op}'.");
+            }
+
+            if (aborted) break;
+        }
+
+        sw.Stop();
+        return JsonSerializer.Serialize(new
+        {
+            Completed = !aborted,
+            AbortedByUser = aborted,
+            ExecutedSteps = results.Count,
+            TotalSteps = steps.Count,
+            ElapsedMs = sw.ElapsedMilliseconds,
+            UipiWarning = Native.GetUipiWarning(),
+            Results = results
         }, JsonOpts);
     }
 
@@ -555,7 +785,7 @@ Captura y entrada fisica:
             Arguments = launchArgs,
             UseShellExecute = true
         };
-        var proc = Process.Start(psi);
+        using var proc = Process.Start(psi);
         return JsonSerializer.Serialize(new
         {
             Launched = true,
@@ -571,6 +801,15 @@ Captura y entrada fisica:
             return Native.GetForegroundWindow();
         var win = ResolveWindow(target) ?? throw new InvalidOperationException($"No se encontro ventana para: {target}");
         return win.Hwnd;
+    }
+
+    private static int CmdSummary(string[] args)
+    {
+        string? target = args.Length > 0 && !args[0].StartsWith("--") ? args[0] : null;
+        int items = int.TryParse(ParseOpt(args, "--items"), out var it) ? it : 40;
+        int texts = int.TryParse(ParseOpt(args, "--texts"), out var tx) ? tx : 30;
+        int timeout = int.TryParse(ParseOpt(args, "--timeout"), out var tm) ? tm : 3000;
+        return PrintOk(AccessibilityReader.GetAccessibleSummaryJson(target, items, texts, timeout));
     }
 
     private static int CmdUia(string[] args)
@@ -677,7 +916,12 @@ Captura y entrada fisica:
 
             Native.GetWindowThreadProcessId(hwnd, out uint pid);
             string procName = "";
-            try { procName = Process.GetProcessById((int)pid).ProcessName; } catch { }
+            try
+            {
+                using var proc = Process.GetProcessById((int)pid);
+                procName = proc.ProcessName;
+            }
+            catch { }
 
             result.Add(new WindowInfo(hwnd, (int)pid, procName, title, r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top));
             return true;
