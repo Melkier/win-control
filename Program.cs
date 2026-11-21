@@ -1,9 +1,6 @@
-﻿using System.IO;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Drawing;
-using System.Drawing.Imaging;
-using System.Runtime.InteropServices;
-using System.Text;
+using System.IO;
 using System.Text.Json;
 using System.Windows.Forms;
 
@@ -40,6 +37,7 @@ internal static class Program
                 "screenshot" => CmdScreenshot(rest),
                 "focus" => rest.Length < 1 ? Fail("Uso: focus <hwnd|titulo>") : PrintOk(FocusTarget(rest[0])),
                 "click" => CmdClick(rest),
+                "hover" => CmdHover(rest),
                 "drag" => CmdDrag(rest),
                 "scroll" => CmdScroll(rest),
                 "type" => rest.Length < 1 ? Fail("Uso: type <texto>") : PrintOk(TypeText(string.Join(" ", rest))),
@@ -48,8 +46,14 @@ internal static class Program
                 "controls" => rest.Length < 1 ? Fail("Uso: controls <hwnd|titulo>") : PrintOk(GetControlsJson(rest[0])),
                 "screens" => PrintOk(GetScreensJson()),
                 "uia" => CmdUia(rest),
+                "uia-act" => CmdUiaAct(rest),
                 "focused" => PrintOk(AccessibilityReader.GetFocusedJson()),
+                "at" => CmdElementAt(rest),
                 "watch" => CmdWatch(),
+                "ocr" => CmdOcr(rest),
+                "clipboard" => CmdClipboard(rest),
+                "window" => CmdWindowManage(rest),
+                "wait" => CmdWaitWindow(rest),
                 _ => Fail($"Comando desconocido: {cmd}")
             };
         }
@@ -82,26 +86,37 @@ internal static class Program
     private static void PrintHelp()
     {
         Console.WriteLine("""
-win-control - Utilidad local y servidor MCP de inspeccion y control de escritorio Windows
+win-control v2.0 - Utilidad local y servidor MCP de accesibilidad y control de escritorio Windows
 
 Modos:
-  --mcp                                    Inicia como servidor MCP (stdio JSON-RPC 2.0)
+  --mcp                                     Inicia como servidor MCP (stdio JSON-RPC 2.0)
 
-Comandos CLI:
-  screens                                  Lista monitores y resoluciones fisicas
-  windows [--filter <texto>]               Lista ventanas visibles con HWND, PID, proceso y bounds
-  controls <hwnd|titulo>                   Lista controles hijos Win32 de una ventana
-  focus <hwnd|titulo>                      Restaura y enfoca una ventana
-  screenshot <ruta.png> [--hwnd <id|tit>]  Captura pantalla completa (o ventana) a PNG
-  click <x> <y> [--right|--double|--middle] Clic en coordenadas fisicas de pantalla
-  drag <x1> <y1> <x2> <y2> [--steps 15]    Arrastra el cursor entre dos puntos
-  scroll <x> <y> <delta>                   Rueda del raton (+ arriba, - abajo; ej: -360)
-  type <texto>                             Escribe texto Unicode en la ventana activa
-  key <combo>                              Envia teclas/atajos (ej: Enter, Ctrl+S, Alt+F4)
-  launch <ruta_o_comando> [args...]        Abre app/carpeta/acceso directo via Shell (persistente)
-  uia [hwnd|titulo] [--depth 6] [--max 250] Lee arbol semantico UI Automation (Chrome, WPF, WinUI, Electron)
-  focused                                  Lee el elemento y texto actualmente enfocado en Windows
-  watch                                    Streaming en tiempo real (NDJSON) de foco y ventanas
+Lectura y accesibilidad:
+  uia [target] [--depth 6] [--max 250] [--filter txt] [--type ControlType] [--timeout 4000]
+  uia-act <invoke|click|set_value|toggle|select|expand|collapse|focus> [--target win] [--name txt] [--id autoId] [--type ControlType] [--value txt] [--index 0]
+  focused                                   Elemento actualmente enfocado en Windows
+  at [x y]                                  Elemento accesible en (x, y) o bajo el cursor actual
+  watch                                     Streaming en tiempo real (NDJSON): foco, ventanas y regiones dinamicas
+  ocr [--target win] [--monitor idx] [--region x,y,w,h] [--lang es-ES]
+
+Ventanas y sistema:
+  screens                                   Lista monitores y resoluciones fisicas
+  windows [--filter txt]                    Lista ventanas visibles con HWND, PID, proceso y bounds
+  controls <hwnd|titulo>                    Lista controles hijos Win32 de una ventana
+  focus <hwnd|titulo>                       Restaura y enfoca una ventana
+  window <target> <minimize|maximize|restore|close|move> [x y w h]
+  wait <target> [--timeout 10000]           Espera a que aparezca una ventana
+  clipboard [get | set <texto>]             Lee o escribe el portapapeles
+  launch <ruta_o_comando> [args...]         Abre app/carpeta/acceso directo via Shell
+
+Captura y entrada fisica:
+  screenshot <ruta> [--hwnd id|tit] [--monitor idx] [--region x,y,w,h] [--jpeg] [--quality 80] [--screen]
+  click <x> <y> [--right|--double|--middle]
+  hover <x> <y>
+  drag <x1> <y1> <x2> <y2> [--steps 15]
+  scroll <x> <y> <delta>
+  type <texto>
+  key <combo>
 """);
     }
 
@@ -210,8 +225,111 @@ Comandos CLI:
             Focused = true,
             Hwnd = $"0x{win.Hwnd.ToInt64():X}",
             win.Title,
-            win.ProcessName
+            win.ProcessName,
+            UipiWarning = Native.GetUipiWarning(win.Hwnd)
         }, JsonOpts);
+    }
+
+    internal static string ManageWindowJson(string target, string action, int? x, int? y, int? width, int? height)
+    {
+        var win = ResolveWindow(target) ?? throw new InvalidOperationException($"No se encontro ventana para: {target}");
+        string act = action.Trim().ToLowerInvariant();
+
+        switch (act)
+        {
+            case "minimize":
+                Native.ShowWindow(win.Hwnd, Native.SW_MINIMIZE);
+                break;
+            case "maximize":
+                Native.ShowWindow(win.Hwnd, Native.SW_MAXIMIZE);
+                break;
+            case "restore":
+                Native.ShowWindow(win.Hwnd, Native.SW_RESTORE);
+                break;
+            case "close":
+                Native.PostMessage(win.Hwnd, Native.WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
+                break;
+            case "move":
+            case "move_resize":
+                if (!x.HasValue || !y.HasValue || !width.HasValue || !height.HasValue || width <= 0 || height <= 0)
+                    throw new ArgumentException("move_resize requiere x, y, width (>0) y height (>0).");
+                Native.ShowWindow(win.Hwnd, Native.SW_RESTORE);
+                Native.MoveWindow(win.Hwnd, x.Value, y.Value, width.Value, height.Value, true);
+                break;
+            default:
+                throw new ArgumentException($"Accion invalida: '{action}'. Usa minimize, maximize, restore, close o move_resize.");
+        }
+
+        return JsonSerializer.Serialize(new
+        {
+            Success = true,
+            Action = act,
+            Hwnd = $"0x{win.Hwnd.ToInt64():X}",
+            win.Title,
+            win.ProcessName,
+            UipiWarning = Native.GetUipiWarning(win.Hwnd)
+        }, JsonOpts);
+    }
+
+    internal static string WaitWindowJson(string target, int timeoutMs)
+    {
+        timeoutMs = Math.Clamp(timeoutMs, 100, 60000);
+        var sw = Stopwatch.StartNew();
+
+        while (sw.ElapsedMilliseconds < timeoutMs)
+        {
+            var win = ResolveWindow(target);
+            if (win != null)
+            {
+                sw.Stop();
+                return JsonSerializer.Serialize(new
+                {
+                    Found = true,
+                    ElapsedMs = sw.ElapsedMilliseconds,
+                    Window = new
+                    {
+                        Hwnd = $"0x{win.Hwnd.ToInt64():X}",
+                        win.Pid,
+                        win.ProcessName,
+                        win.Title,
+                        win.X,
+                        win.Y,
+                        win.Width,
+                        win.Height
+                    }
+                }, JsonOpts);
+            }
+            Thread.Sleep(150);
+        }
+
+        sw.Stop();
+        return JsonSerializer.Serialize(new
+        {
+            Found = false,
+            Target = target,
+            ElapsedMs = sw.ElapsedMilliseconds
+        }, JsonOpts);
+    }
+
+    internal static string ClipboardActionJson(string action, string? text)
+    {
+        string act = action.Trim().ToLowerInvariant();
+        return act switch
+        {
+            "get" => RunOnSta(() =>
+            {
+                string content = Clipboard.ContainsText() ? Clipboard.GetText() : "";
+                return JsonSerializer.Serialize(new { Action = "get", Length = content.Length, Text = content }, JsonOpts);
+            }),
+            "set" => RunOnSta(() =>
+            {
+                if (text == null) throw new ArgumentException("Falta el parametro 'text' para clipboard set.");
+                if (text.Length == 0) Clipboard.Clear();
+                else Clipboard.SetText(text);
+                return JsonSerializer.Serialize(new { Action = "set", Length = text.Length, Success = true }, JsonOpts);
+            }),
+            _ => throw new ArgumentException($"Accion de portapapeles invalida: '{action}'. Usa get o set.")
+        };
     }
 
     internal static Rectangle ResolveCaptureBounds(string? hwndOrTitle, int? monitorIdx)
@@ -233,28 +351,46 @@ Comandos CLI:
 
     private static int CmdScreenshot(string[] args)
     {
-        if (args.Length < 1) return Fail("Uso: screenshot <ruta.png> [--hwnd <id|titulo>] [--monitor <idx>]");
+        if (args.Length < 1) return Fail("Uso: screenshot <ruta> [--hwnd <id|titulo>] [--monitor <idx>] [--region x,y,w,h] [--jpeg] [--quality 80] [--screen]");
         string outPath = Path.GetFullPath(args[0]);
         string? hwndArg = ParseOpt(args, "--hwnd");
         int? monitorIdx = int.TryParse(ParseOpt(args, "--monitor"), out var m) ? m : null;
+        var region = ScreenCapture.ParseRegion(ParseOpt(args, "--region"));
+        bool isJpeg = args.Contains("--jpeg") || outPath.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) || outPath.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase);
+        int quality = int.TryParse(ParseOpt(args, "--quality"), out var q) ? q : 80;
+        string mode = args.Contains("--screen") ? "screen" : "auto";
 
-        Rectangle bounds = ResolveCaptureBounds(hwndArg, monitorIdx);
+        var capture = ScreenCapture.CaptureBitmap(hwndArg, monitorIdx, region, mode);
+        using var bmp = capture.Bitmap;
+        var encoded = ScreenCapture.EncodeBitmap(bmp, 0, isJpeg ? "jpeg" : "png", quality);
+
         Directory.CreateDirectory(Path.GetDirectoryName(outPath)!);
-        using var bmp = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
-        using (var g = Graphics.FromImage(bmp))
-        {
-            g.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, bounds.Size, CopyPixelOperation.SourceCopy);
-        }
-        bmp.Save(outPath, ImageFormat.Png);
+        File.WriteAllBytes(outPath, encoded.Bytes);
 
         return PrintOk(JsonSerializer.Serialize(new
         {
             Saved = outPath,
-            bounds.Left,
-            bounds.Top,
-            bounds.Width,
-            bounds.Height
+            Format = encoded.MimeType,
+            CaptureMode = capture.ModeUsed,
+            Bytes = encoded.Bytes.Length,
+            capture.PhysicalBounds.Left,
+            capture.PhysicalBounds.Top,
+            capture.PhysicalBounds.Width,
+            capture.PhysicalBounds.Height
         }, JsonOpts));
+    }
+
+    internal static string HoverAt(int x, int y)
+    {
+        Native.SetCursorPos(x, y);
+        return JsonSerializer.Serialize(new { Hovered = true, x, y }, JsonOpts);
+    }
+
+    private static int CmdHover(string[] args)
+    {
+        if (args.Length < 2 || !int.TryParse(args[0], out int x) || !int.TryParse(args[1], out int y))
+            return Fail("Uso: hover <x> <y>");
+        return PrintOk(HoverAt(x, y));
     }
 
     internal static string ClickAt(int x, int y, string button)
@@ -291,7 +427,14 @@ Comandos CLI:
                 break;
         }
 
-        return JsonSerializer.Serialize(new { Clicked = true, x, y, button = btn }, JsonOpts);
+        return JsonSerializer.Serialize(new
+        {
+            Clicked = true,
+            x,
+            y,
+            button = btn,
+            UipiWarning = Native.GetUipiWarning()
+        }, JsonOpts);
     }
 
     private static int CmdClick(string[] args)
@@ -322,7 +465,16 @@ Comandos CLI:
         }
 
         Native.SendMouse(Native.MOUSEEVENTF_LEFTUP);
-        return JsonSerializer.Serialize(new { Dragged = true, x1, y1, x2, y2, steps }, JsonOpts);
+        return JsonSerializer.Serialize(new
+        {
+            Dragged = true,
+            x1,
+            y1,
+            x2,
+            y2,
+            steps,
+            UipiWarning = Native.GetUipiWarning()
+        }, JsonOpts);
     }
 
     private static int CmdDrag(string[] args)
@@ -342,7 +494,14 @@ Comandos CLI:
         Native.SetCursorPos(x, y);
         Thread.Sleep(30);
         Native.SendMouseWheel(delta);
-        return JsonSerializer.Serialize(new { Scrolled = true, x, y, delta }, JsonOpts);
+        return JsonSerializer.Serialize(new
+        {
+            Scrolled = true,
+            x,
+            y,
+            delta,
+            UipiWarning = Native.GetUipiWarning()
+        }, JsonOpts);
     }
 
     private static int CmdScroll(string[] args)
@@ -358,7 +517,12 @@ Comandos CLI:
     internal static string TypeText(string text)
     {
         Native.SendUnicodeText(text);
-        return JsonSerializer.Serialize(new { Typed = true, Length = text.Length }, JsonOpts);
+        return JsonSerializer.Serialize(new
+        {
+            Typed = true,
+            Length = text.Length,
+            UipiWarning = Native.GetUipiWarning()
+        }, JsonOpts);
     }
 
     internal static string SendKeyCombo(string combo)
@@ -376,7 +540,11 @@ Comandos CLI:
         Thread.Sleep(30);
         for (int i = vks.Count - 1; i >= 0; i--) Native.SendKey(vks[i], true);
 
-        return JsonSerializer.Serialize(new { KeySent = combo }, JsonOpts);
+        return JsonSerializer.Serialize(new
+        {
+            KeySent = combo,
+            UipiWarning = Native.GetUipiWarning()
+        }, JsonOpts);
     }
 
     internal static string LaunchTarget(string target, string launchArgs)
@@ -410,7 +578,31 @@ Comandos CLI:
         string? target = args.Length > 0 && !args[0].StartsWith("--") ? args[0] : null;
         int depth = int.TryParse(ParseOpt(args, "--depth"), out var d) ? d : 6;
         int maxNodes = int.TryParse(ParseOpt(args, "--max"), out var m) ? m : 250;
-        return PrintOk(AccessibilityReader.GetUiTreeJson(target, depth, maxNodes));
+        string? filter = ParseOpt(args, "--filter");
+        string? cType = ParseOpt(args, "--type");
+        int timeout = int.TryParse(ParseOpt(args, "--timeout"), out var t) ? t : 4000;
+        return PrintOk(AccessibilityReader.GetUiTreeJson(target, depth, maxNodes, filter, cType, timeout));
+    }
+
+    private static int CmdUiaAct(string[] args)
+    {
+        if (args.Length < 1) return Fail("Uso: uia-act <action> [--target win] [--name txt] [--id autoId] [--type ControlType] [--value txt] [--index 0]");
+        string action = args[0];
+        string? target = ParseOpt(args, "--target");
+        string? name = ParseOpt(args, "--name");
+        string? id = ParseOpt(args, "--id");
+        string? cType = ParseOpt(args, "--type");
+        string? val = ParseOpt(args, "--value");
+        int idx = int.TryParse(ParseOpt(args, "--index"), out var i) ? i : 0;
+        int timeout = int.TryParse(ParseOpt(args, "--timeout"), out var t) ? t : 4000;
+        return PrintOk(AccessibilityReader.PerformUiAction(target, action, name, id, cType, val, idx, timeout));
+    }
+
+    private static int CmdElementAt(string[] args)
+    {
+        int? x = args.Length >= 2 && int.TryParse(args[0], out int px) ? px : null;
+        int? y = args.Length >= 2 && int.TryParse(args[1], out int py) ? py : null;
+        return PrintOk(AccessibilityReader.GetElementAtPointJson(x, y));
     }
 
     private static int CmdWatch()
@@ -420,7 +612,40 @@ Comandos CLI:
         return AccessibilityReader.RunWatchCli(cts.Token);
     }
 
-    private static WindowInfo? ResolveWindow(string spec)
+    private static int CmdOcr(string[] args)
+    {
+        string? target = ParseOpt(args, "--target");
+        int? monitorIdx = int.TryParse(ParseOpt(args, "--monitor"), out var m) ? m : null;
+        string? region = ParseOpt(args, "--region");
+        string? lang = ParseOpt(args, "--lang");
+        return PrintOk(OcrReader.RunOcrJson(target, monitorIdx, region, lang));
+    }
+
+    private static int CmdClipboard(string[] args)
+    {
+        string action = args.Length == 0 ? "get" : args[0];
+        string? text = args.Length > 1 ? string.Join(" ", args.Skip(1)) : null;
+        return PrintOk(ClipboardActionJson(action, text));
+    }
+
+    private static int CmdWindowManage(string[] args)
+    {
+        if (args.Length < 2) return Fail("Uso: window <target> <minimize|maximize|restore|close|move> [x y w h]");
+        int? x = args.Length >= 6 && int.TryParse(args[2], out int px) ? px : null;
+        int? y = args.Length >= 6 && int.TryParse(args[3], out int py) ? py : null;
+        int? w = args.Length >= 6 && int.TryParse(args[4], out int pw) ? pw : null;
+        int? h = args.Length >= 6 && int.TryParse(args[5], out int ph) ? ph : null;
+        return PrintOk(ManageWindowJson(args[0], args[1], x, y, w, h));
+    }
+
+    private static int CmdWaitWindow(string[] args)
+    {
+        if (args.Length < 1) return Fail("Uso: wait <target> [--timeout 10000]");
+        int timeout = int.TryParse(ParseOpt(args, "--timeout"), out var t) ? t : 10000;
+        return PrintOk(WaitWindowJson(args[0], timeout));
+    }
+
+    internal static WindowInfo? ResolveWindow(string spec)
     {
         var wins = GetVisibleWindows();
         if (spec.StartsWith("0x", StringComparison.OrdinalIgnoreCase)
@@ -460,6 +685,26 @@ Comandos CLI:
         return result;
     }
 
+    private static T RunOnSta<T>(Func<T> action)
+    {
+        if (Thread.CurrentThread.GetApartmentState() == ApartmentState.STA)
+            return action();
+
+        T? result = default;
+        Exception? captured = null;
+        var thread = new Thread(() =>
+        {
+            try { result = action(); }
+            catch (Exception ex) { captured = ex; }
+        });
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join();
+
+        if (captured != null) throw new InvalidOperationException(captured.Message, captured);
+        return result!;
+    }
+
     private static bool TryParseKey(string name, out ushort vk)
     {
         vk = name.ToUpperInvariant() switch
@@ -468,6 +713,7 @@ Comandos CLI:
             "ALT" or "MENU" => 0x12,
             "SHIFT" => 0x10,
             "WIN" or "LWIN" => 0x5B,
+            "RWIN" => 0x5C,
             "ENTER" or "RETURN" => 0x0D,
             "ESC" or "ESCAPE" => 0x1B,
             "TAB" => 0x09,
@@ -483,6 +729,8 @@ Comandos CLI:
             "DOWN" => 0x28,
             "LEFT" => 0x25,
             "RIGHT" => 0x27,
+            "PRTSC" or "PRINTSCREEN" => 0x2C,
+            "CAPSLOCK" => 0x14,
             "F1" => 0x70, "F2" => 0x71, "F3" => 0x72, "F4" => 0x73,
             "F5" => 0x74, "F6" => 0x75, "F7" => 0x76, "F8" => 0x77,
             "F9" => 0x78, "F10" => 0x79, "F11" => 0x7A, "F12" => 0x7B,
@@ -501,165 +749,5 @@ Comandos CLI:
         return false;
     }
 
-    private sealed record WindowInfo(IntPtr Hwnd, int Pid, string ProcessName, string Title, int X, int Y, int Width, int Height);
+    internal sealed record WindowInfo(IntPtr Hwnd, int Pid, string ProcessName, string Title, int X, int Y, int Width, int Height);
 }
-
-internal static class Native
-{
-    public const int SW_SHOW = 5;
-    public const int SW_RESTORE = 9;
-    public const uint MOUSEEVENTF_LEFTDOWN = 0x0002;
-    public const uint MOUSEEVENTF_LEFTUP = 0x0004;
-    public const uint MOUSEEVENTF_RIGHTDOWN = 0x0008;
-    public const uint MOUSEEVENTF_RIGHTUP = 0x0010;
-    public const uint MOUSEEVENTF_MIDDLEDOWN = 0x0020;
-    public const uint MOUSEEVENTF_MIDDLEUP = 0x0040;
-    public const uint MOUSEEVENTF_WHEEL = 0x0800;
-    private const uint INPUT_MOUSE = 0;
-    private const uint INPUT_KEYBOARD = 1;
-    private const uint KEYEVENTF_KEYUP = 0x0002;
-    private const uint KEYEVENTF_UNICODE = 0x0004;
-
-    public delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
-
-    [DllImport("user32.dll")] private static extern bool SetProcessDpiAwarenessContext(IntPtr value);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
-    [DllImport("user32.dll")] public static extern bool EnumChildWindows(IntPtr hWndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool IsZoomed(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
-    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-    [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
-    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetWindowTextLength(IntPtr hWnd);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
-    [DllImport("user32.dll", SetLastError = true)] private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-
-    public static void SetDpiAware()
-    {
-        try { SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { }
-    }
-
-    public static string GetWindowTextString(IntPtr hWnd)
-    {
-        int len = GetWindowTextLength(hWnd);
-        if (len <= 0) return "";
-        var sb = new StringBuilder(len + 1);
-        GetWindowText(hWnd, sb, sb.Capacity);
-        return sb.ToString();
-    }
-
-    public static string GetClassNameText(IntPtr hWnd)
-    {
-        var sb = new StringBuilder(256);
-        GetClassName(hWnd, sb, sb.Capacity);
-        return sb.ToString();
-    }
-
-    public static void SendMouse(uint flags)
-    {
-        var input = new INPUT
-        {
-            type = INPUT_MOUSE,
-            U = new InputUnion { mi = new MOUSEINPUT { dwFlags = flags } }
-        };
-        SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
-    }
-
-    public static void SendMouseWheel(int delta)
-    {
-        var input = new INPUT
-        {
-            type = INPUT_MOUSE,
-            U = new InputUnion { mi = new MOUSEINPUT { dwFlags = MOUSEEVENTF_WHEEL, mouseData = unchecked((uint)delta) } }
-        };
-        SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
-    }
-
-    public static void SendKey(ushort vk, bool keyUp)
-    {
-        var input = new INPUT
-        {
-            type = INPUT_KEYBOARD,
-            U = new InputUnion
-            {
-                ki = new KEYBDINPUT
-                {
-                    wVk = vk,
-                    dwFlags = keyUp ? KEYEVENTF_KEYUP : 0
-                }
-            }
-        };
-        SendInput(1, new[] { input }, Marshal.SizeOf<INPUT>());
-    }
-
-    public static void SendUnicodeText(string text)
-    {
-        var list = new List<INPUT>(text.Length * 2);
-        foreach (char c in text)
-        {
-            list.Add(new INPUT
-            {
-                type = INPUT_KEYBOARD,
-                U = new InputUnion { ki = new KEYBDINPUT { wScan = c, dwFlags = KEYEVENTF_UNICODE } }
-            });
-            list.Add(new INPUT
-            {
-                type = INPUT_KEYBOARD,
-                U = new InputUnion { ki = new KEYBDINPUT { wScan = c, dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP } }
-            });
-        }
-        if (list.Count > 0)
-            SendInput((uint)list.Count, list.ToArray(), Marshal.SizeOf<INPUT>());
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    public struct RECT { public int Left, Top, Right, Bottom; }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct INPUT
-    {
-        public uint type;
-        public InputUnion U;
-    }
-
-    [StructLayout(LayoutKind.Explicit)]
-    private struct InputUnion
-    {
-        [FieldOffset(0)] public MOUSEINPUT mi;
-        [FieldOffset(0)] public KEYBDINPUT ki;
-        [FieldOffset(0)] public HARDWAREINPUT hi;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MOUSEINPUT
-    {
-        public int dx, dy;
-        public uint mouseData, dwFlags, time;
-        public IntPtr dwExtraInfo;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct KEYBDINPUT
-    {
-        public ushort wVk, wScan;
-        public uint dwFlags, time;
-        public IntPtr dwExtraInfo;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct HARDWAREINPUT
-    {
-        public uint uMsg;
-        public ushort wParamL, wParamH;
-    }
-}
-
-

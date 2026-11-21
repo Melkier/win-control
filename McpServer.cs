@@ -1,11 +1,7 @@
-﻿using System.IO;
-using System.Drawing;
-using System.Drawing.Drawing2D;
-using System.Drawing.Imaging;
+﻿using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Windows.Forms;
 
 namespace WinControl;
 
@@ -42,11 +38,7 @@ internal static class McpServer
         var method = msg["method"]?.GetValue<string>() ?? "";
         var @params = msg["params"] as JsonObject;
 
-        // Notifications have no id
-        if (id == null)
-        {
-            return;
-        }
+        if (id == null) return;
 
         try
         {
@@ -65,7 +57,7 @@ internal static class McpServer
                         ["serverInfo"] = new JsonObject
                         {
                             ["name"] = "win-control",
-                            ["version"] = "1.0.0"
+                            ["version"] = "2.0.0"
                         }
                     };
                     SendResult(id, result);
@@ -100,29 +92,82 @@ internal static class McpServer
     {
         return new JsonArray
         {
-            Tool("desktop_uia_tree", "Lee el arbol semantico completo de accesibilidad (UI Automation) de la ventana activa o indicada: textos, botones, enlaces, entradas y coordenadas en Chrome, Edge, Electron, WPF, WinUI y Win32.", new JsonObject
+            Tool("desktop_uia_tree", "Lee el arbol semantico de accesibilidad (UI Automation) de la ventana activa o indicada con filtros opcionales y timeout seguro.", new JsonObject
             {
                 ["type"] = "object",
                 ["properties"] = new JsonObject
                 {
                     ["target"] = Prop("string", "Opcional: HWND o subcadena de titulo/proceso. Si se omite, lee la ventana activa."),
-                    ["max_depth"] = Prop("integer", "Opcional: profundidad maxima del arbol (defecto 6, max 15)."),
-                    ["max_nodes"] = Prop("integer", "Opcional: maximo de nodos a devolver (defecto 250, max 1500).")
+                    ["max_depth"] = Prop("integer", "Opcional: profundidad maxima (defecto 6, max 15)."),
+                    ["max_nodes"] = Prop("integer", "Opcional: maximo de nodos (defecto 250, max 1500)."),
+                    ["filter"] = Prop("string", "Opcional: filtra nodos cuyo Name, Value, Text o AutomationId contenga este texto."),
+                    ["control_type"] = Prop("string", "Opcional: filtra por ControlType (ej: Button, Edit, Hyperlink, Text, ListItem)."),
+                    ["timeout_ms"] = Prop("integer", "Opcional: limite de tiempo en ms (defecto 4000, max 15000).")
                 }
             }),
-            Tool("desktop_focused", "Devuelve en tiempo real el elemento actualmente enfocado, su texto/valor, ventana y si el proceso corre elevado.", new JsonObject
-            {
-                ["type"] = "object",
-                ["properties"] = new JsonObject()
-            }),
-            Tool("desktop_watch_events", "Inicia, consulta o detiene un monitor en tiempo real de eventos de foco y cambios de ventana en todo Windows.", new JsonObject
+            Tool("desktop_uia_act", "Ejecuta una accion semantica directa sobre un control por Name, AutomationId o ControlType sin calcular coordenadas manualmente.", new JsonObject
             {
                 ["type"] = "object",
                 ["properties"] = new JsonObject
                 {
-                    ["action"] = Prop("string", "Accion: start (iniciar), poll (leer eventos acumulados) o stop (detener).")
+                    ["action"] = Prop("string", "Accion: invoke, click, set_value, toggle, select, expand, collapse o focus."),
+                    ["target"] = Prop("string", "Opcional: HWND o subcadena de titulo/proceso. Si se omite, usa la ventana activa."),
+                    ["name"] = Prop("string", "Opcional: nombre exacto o subcadena del elemento."),
+                    ["automation_id"] = Prop("string", "Opcional: AutomationId exacto del elemento."),
+                    ["control_type"] = Prop("string", "Opcional: ControlType (ej: Button, Edit, CheckBox)."),
+                    ["value"] = Prop("string", "Requerido para set_value: texto a asignar."),
+                    ["index"] = Prop("integer", "Opcional: indice si hay multiples coincidencias (defecto 0)."),
+                    ["timeout_ms"] = Prop("integer", "Opcional: tiempo limite de busqueda en ms (defecto 4000).")
                 },
                 ["required"] = new JsonArray("action")
+            }),
+            Tool("desktop_focused", "Devuelve en tiempo real el elemento enfocado, su texto/valor, ventana y estado de elevacion/UIPI.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject()
+            }),
+            Tool("desktop_element_at", "Lee el elemento accesible en las coordenadas (x, y) o bajo la posicion actual del cursor.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["x"] = Prop("integer", "Opcional: coordenada X fisica (si se omite, usa el cursor actual)."),
+                    ["y"] = Prop("integer", "Opcional: coordenada Y fisica (si se omite, usa el cursor actual).")
+                }
+            }),
+            Tool("desktop_watch_events", "Inicia, consulta o detiene un monitor en tiempo real de foco, cambios de ventana, nuevas ventanas y regiones dinamicas (LiveRegion).", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["action"] = Prop("string", "Accion: start, poll o stop.")
+                },
+                ["required"] = new JsonArray("action")
+            }),
+            Tool("desktop_ocr", "Ejecuta OCR nativo offline de Windows sobre una ventana, monitor o region para leer texto y coordenadas en apps graficas sin UIA.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["target"] = Prop("string", "Opcional: HWND o subcadena de titulo/proceso."),
+                    ["monitor"] = Prop("integer", "Opcional: indice de monitor (0, 1, ...)."),
+                    ["region"] = Prop("string", "Opcional: recorte fisico 'x,y,width,height'."),
+                    ["lang"] = Prop("string", "Opcional: codigo de idioma instalado (ej: es-ES, en-US).")
+                }
+            }),
+            Tool("desktop_screenshot", "Captura pantalla, monitor, ventana (con PrintWindow anti-oclusion) o region en PNG o JPEG con coordenadas fisicas.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["target"] = Prop("string", "Opcional: HWND o subcadena de titulo/proceso."),
+                    ["monitor"] = Prop("integer", "Opcional: indice de monitor (0, 1, ...)."),
+                    ["region"] = Prop("string", "Opcional: recorte fisico 'x,y,width,height'."),
+                    ["max_width"] = Prop("integer", "Opcional: ancho maximo en pixeles (defecto 1280)."),
+                    ["format"] = Prop("string", "Opcional: png (defecto) o jpeg (mas ligero para tiempo real)."),
+                    ["quality"] = Prop("integer", "Opcional: calidad JPEG 10-100 (defecto 80)."),
+                    ["capture_mode"] = Prop("string", "Opcional: auto (defecto, usa PrintWindow en ventanas) o screen.")
+                }
             }),
             Tool("desktop_screens", "Lista monitores conectados y sus coordenadas/resoluciones fisicas.", new JsonObject
             {
@@ -146,22 +191,12 @@ internal static class McpServer
                 },
                 ["required"] = new JsonArray("target")
             }),
-            Tool("desktop_screenshot", "Captura la pantalla completa, un monitor o una ventana y devuelve la imagen PNG y sus coordenadas fisicas.", new JsonObject
+            Tool("desktop_launch", "Abre una aplicacion, acceso directo (.lnk), carpeta, archivo o URL en el escritorio.", new JsonObject
             {
                 ["type"] = "object",
                 ["properties"] = new JsonObject
                 {
-                    ["target"] = Prop("string", "Opcional: HWND o subcadena de titulo/proceso para capturar solo esa ventana."),
-                    ["monitor"] = Prop("integer", "Opcional: indice de monitor (0, 1, ...)."),
-                    ["max_width"] = Prop("integer", "Opcional: ancho maximo en pixeles para reducir tamano (por defecto 1280).")
-                }
-            }),
-            Tool("desktop_launch", "Abre una aplicacion, acceso directo (.lnk), carpeta o archivo en el escritorio del usuario.", new JsonObject
-            {
-                ["type"] = "object",
-                ["properties"] = new JsonObject
-                {
-                    ["target"] = Prop("string", "Ruta del ejecutable, acceso directo, carpeta o comando."),
+                    ["target"] = Prop("string", "Ruta del ejecutable, acceso directo, carpeta, URL o comando."),
                     ["args"] = Prop("string", "Argumentos opcionales.")
                 },
                 ["required"] = new JsonArray("target")
@@ -175,6 +210,40 @@ internal static class McpServer
                 },
                 ["required"] = new JsonArray("target")
             }),
+            Tool("desktop_window_manage", "Minimiza, maximiza, restaura, cierra o mueve/redimensiona una ventana.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["target"] = Prop("string", "HWND o subcadena del titulo/proceso."),
+                    ["action"] = Prop("string", "Accion: minimize, maximize, restore, close o move_resize."),
+                    ["x"] = Prop("integer", "Requerido para move_resize: nueva X."),
+                    ["y"] = Prop("integer", "Requerido para move_resize: nueva Y."),
+                    ["width"] = Prop("integer", "Requerido para move_resize: nuevo ancho."),
+                    ["height"] = Prop("integer", "Requerido para move_resize: nuevo alto.")
+                },
+                ["required"] = new JsonArray("target", "action")
+            }),
+            Tool("desktop_wait_window", "Espera hasta timeout_ms a que aparezca una ventana por titulo o proceso.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["target"] = Prop("string", "Subcadena del titulo o nombre de proceso."),
+                    ["timeout_ms"] = Prop("integer", "Opcional: tiempo maximo de espera en ms (defecto 10000).")
+                },
+                ["required"] = new JsonArray("target")
+            }),
+            Tool("desktop_clipboard", "Lee (get) o escribe (set) texto en el portapapeles de Windows.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["action"] = Prop("string", "Accion: get o set."),
+                    ["text"] = Prop("string", "Texto a copiar cuando action es set.")
+                },
+                ["required"] = new JsonArray("action")
+            }),
             Tool("desktop_click", "Mueve el cursor y hace clic en coordenadas fisicas (x, y) de pantalla.", new JsonObject
             {
                 ["type"] = "object",
@@ -183,6 +252,16 @@ internal static class McpServer
                     ["x"] = Prop("integer", "Coordenada X fisica en pantalla."),
                     ["y"] = Prop("integer", "Coordenada Y fisica en pantalla."),
                     ["button"] = Prop("string", "left (defecto), right, middle o double.")
+                },
+                ["required"] = new JsonArray("x", "y")
+            }),
+            Tool("desktop_hover", "Mueve el cursor a coordenadas fisicas (x, y) sin hacer clic.", new JsonObject
+            {
+                ["type"] = "object",
+                ["properties"] = new JsonObject
+                {
+                    ["x"] = Prop("integer", "Coordenada X fisica."),
+                    ["y"] = Prop("integer", "Coordenada Y fisica.")
                 },
                 ["required"] = new JsonArray("x", "y")
             }),
@@ -210,7 +289,7 @@ internal static class McpServer
                 },
                 ["required"] = new JsonArray("x", "y", "delta")
             }),
-            Tool("desktop_type", "Escribe texto Unicode en la ventana actualmente enfocada.", new JsonObject
+            Tool("desktop_type", "Escribe texto Unicode (con soporte de saltos de linea y tabulacion) en la ventana enfocada.", new JsonObject
             {
                 ["type"] = "object",
                 ["properties"] = new JsonObject
@@ -237,21 +316,67 @@ internal static class McpServer
         {
             return name switch
             {
-                "desktop_screens" => TextResult(Program.GetScreensJson()),
-                "desktop_windows" => TextResult(Program.GetWindowsJson(args["filter"]?.GetValue<string>())),
-                "desktop_controls" => TextResult(Program.GetControlsJson(RequireStr(args, "target"))),
+                "desktop_uia_tree" => TextResult(AccessibilityReader.GetUiTreeJson(
+                    args["target"]?.GetValue<string>(),
+                    args["max_depth"]?.GetValue<int?>() ?? 6,
+                    args["max_nodes"]?.GetValue<int?>() ?? 250,
+                    args["filter"]?.GetValue<string>(),
+                    args["control_type"]?.GetValue<string>(),
+                    args["timeout_ms"]?.GetValue<int?>() ?? 4000)),
+                "desktop_uia_act" => TextResult(AccessibilityReader.PerformUiAction(
+                    args["target"]?.GetValue<string>(),
+                    RequireStr(args, "action"),
+                    args["name"]?.GetValue<string>(),
+                    args["automation_id"]?.GetValue<string>(),
+                    args["control_type"]?.GetValue<string>(),
+                    args["value"]?.GetValue<string>(),
+                    args["index"]?.GetValue<int?>() ?? 0,
+                    args["timeout_ms"]?.GetValue<int?>() ?? 4000)),
+                "desktop_focused" => TextResult(AccessibilityReader.GetFocusedJson()),
+                "desktop_element_at" => TextResult(AccessibilityReader.GetElementAtPointJson(
+                    args["x"]?.GetValue<int?>(),
+                    args["y"]?.GetValue<int?>())),
+                "desktop_watch_events" => TextResult(AccessibilityReader.ControlWatchMcp(RequireStr(args, "action"))),
+                "desktop_ocr" => TextResult(OcrReader.RunOcrJson(
+                    args["target"]?.GetValue<string>(),
+                    args["monitor"]?.GetValue<int?>(),
+                    args["region"]?.GetValue<string>(),
+                    args["lang"]?.GetValue<string>())),
                 "desktop_screenshot" => CaptureScreenshotMcp(
                     args["target"]?.GetValue<string>(),
                     args["monitor"]?.GetValue<int?>(),
-                    args["max_width"]?.GetValue<int?>() ?? 1280),
+                    args["region"]?.GetValue<string>(),
+                    args["max_width"]?.GetValue<int?>() ?? 1280,
+                    args["format"]?.GetValue<string>() ?? "png",
+                    args["quality"]?.GetValue<int?>() ?? 80,
+                    args["capture_mode"]?.GetValue<string>() ?? "auto"),
+                "desktop_screens" => TextResult(Program.GetScreensJson()),
+                "desktop_windows" => TextResult(Program.GetWindowsJson(args["filter"]?.GetValue<string>())),
+                "desktop_controls" => TextResult(Program.GetControlsJson(RequireStr(args, "target"))),
                 "desktop_launch" => TextResult(Program.LaunchTarget(
                     RequireStr(args, "target"),
                     args["args"]?.GetValue<string>() ?? "")),
                 "desktop_focus" => TextResult(Program.FocusTarget(RequireStr(args, "target"))),
+                "desktop_window_manage" => TextResult(Program.ManageWindowJson(
+                    RequireStr(args, "target"),
+                    RequireStr(args, "action"),
+                    args["x"]?.GetValue<int?>(),
+                    args["y"]?.GetValue<int?>(),
+                    args["width"]?.GetValue<int?>(),
+                    args["height"]?.GetValue<int?>())),
+                "desktop_wait_window" => TextResult(Program.WaitWindowJson(
+                    RequireStr(args, "target"),
+                    args["timeout_ms"]?.GetValue<int?>() ?? 10000)),
+                "desktop_clipboard" => TextResult(Program.ClipboardActionJson(
+                    RequireStr(args, "action"),
+                    args["text"]?.GetValue<string>())),
                 "desktop_click" => TextResult(Program.ClickAt(
                     RequireInt(args, "x"),
                     RequireInt(args, "y"),
                     args["button"]?.GetValue<string>() ?? "left")),
+                "desktop_hover" => TextResult(Program.HoverAt(
+                    RequireInt(args, "x"),
+                    RequireInt(args, "y"))),
                 "desktop_drag" => TextResult(Program.DragBetween(
                     RequireInt(args, "x1"),
                     RequireInt(args, "y1"),
@@ -264,12 +389,6 @@ internal static class McpServer
                     RequireInt(args, "delta"))),
                 "desktop_type" => TextResult(Program.TypeText(RequireStr(args, "text"))),
                 "desktop_key" => TextResult(Program.SendKeyCombo(RequireStr(args, "combo"))),
-                "desktop_uia_tree" => TextResult(AccessibilityReader.GetUiTreeJson(
-                    args["target"]?.GetValue<string>(),
-                    args["max_depth"]?.GetValue<int?>() ?? 6,
-                    args["max_nodes"]?.GetValue<int?>() ?? 250)),
-                "desktop_focused" => TextResult(AccessibilityReader.GetFocusedJson()),
-                "desktop_watch_events" => TextResult(AccessibilityReader.ControlWatchMcp(RequireStr(args, "action"))),
                 _ => ErrorResult($"Herramienta desconocida: {name}")
             };
         }
@@ -279,48 +398,39 @@ internal static class McpServer
         }
     }
 
-    private static JsonObject CaptureScreenshotMcp(string? target, int? monitorIdx, int maxWidth)
+    private static JsonObject CaptureScreenshotMcp(
+        string? target,
+        int? monitorIdx,
+        string? regionSpec,
+        int maxWidth,
+        string format,
+        int quality,
+        string captureMode)
     {
-        Rectangle bounds = Program.ResolveCaptureBounds(target, monitorIdx);
-        using var fullBmp = new Bitmap(bounds.Width, bounds.Height, PixelFormat.Format32bppArgb);
-        using (var g = Graphics.FromImage(fullBmp))
-        {
-            g.CopyFromScreen(bounds.Left, bounds.Top, 0, 0, bounds.Size, CopyPixelOperation.SourceCopy);
-        }
+        var sw = Stopwatch.StartNew();
+        var region = ScreenCapture.ParseRegion(regionSpec);
+        var capture = ScreenCapture.CaptureBitmap(target, monitorIdx, region, captureMode);
+        using var bmp = capture.Bitmap;
+        var encoded = ScreenCapture.EncodeBitmap(bmp, maxWidth, format, quality);
+        sw.Stop();
 
-        Bitmap toEncode = fullBmp;
-        Bitmap? resized = null;
-        double scale = 1.0;
-
-        if (maxWidth > 0 && fullBmp.Width > maxWidth)
-        {
-            scale = (double)maxWidth / fullBmp.Width;
-            int newW = maxWidth;
-            int newH = Math.Max(1, (int)Math.Round(fullBmp.Height * scale));
-            resized = new Bitmap(newW, newH, PixelFormat.Format32bppArgb);
-            using (var rg = Graphics.FromImage(resized))
-            {
-                rg.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                rg.DrawImage(fullBmp, 0, 0, newW, newH);
-            }
-            toEncode = resized;
-        }
-
-        int outWidth = toEncode.Width;
-        int outHeight = toEncode.Height;
-        string base64;
-        using (var ms = new MemoryStream())
-        {
-            toEncode.Save(ms, ImageFormat.Png);
-            base64 = Convert.ToBase64String(ms.ToArray());
-        }
-        resized?.Dispose();
+        string base64 = Convert.ToBase64String(encoded.Bytes);
 
         var meta = JsonSerializer.Serialize(new
         {
-            PhysicalBounds = new { bounds.Left, bounds.Top, bounds.Width, bounds.Height },
-            ImageSize = new { Width = outWidth, Height = outHeight },
-            ScaleToImage = scale,
+            CaptureMode = capture.ModeUsed,
+            MimeType = encoded.MimeType,
+            Bytes = encoded.Bytes.Length,
+            ElapsedMs = sw.ElapsedMilliseconds,
+            PhysicalBounds = new
+            {
+                capture.PhysicalBounds.Left,
+                capture.PhysicalBounds.Top,
+                capture.PhysicalBounds.Width,
+                capture.PhysicalBounds.Height
+            },
+            ImageSize = new { encoded.Width, encoded.Height },
+            encoded.ScaleToImage,
             Note = "Para desktop_click usa coordenadas fisicas: x_phys = Left + x_img / ScaleToImage, y_phys = Top + y_img / ScaleToImage."
         });
 
@@ -329,7 +439,7 @@ internal static class McpServer
             ["content"] = new JsonArray
             {
                 new JsonObject { ["type"] = "text", ["text"] = meta },
-                new JsonObject { ["type"] = "image", ["data"] = base64, ["mimeType"] = "image/png" }
+                new JsonObject { ["type"] = "image", ["data"] = base64, ["mimeType"] = encoded.MimeType }
             },
             ["isError"] = false
         };
@@ -394,5 +504,3 @@ internal static class McpServer
         Console.Out.Flush();
     }
 }
-
-
